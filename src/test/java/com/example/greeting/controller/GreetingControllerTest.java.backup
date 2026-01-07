@@ -23,13 +23,8 @@ class GreetingControllerTest {
   @Test
   void testGreet() throws Exception {
     // Test GET /greet
-    
-    String requestBody = "{\"name\":\"TestName\",\"language\":\"english\"}";
     mockMvc.perform(get("/api/greet")
-            .param("name", "TestValue")
-            .param("language", "english")
-            .contentType(MediaType.APPLICATION_JSON)
-            .content(requestBody))
+            .contentType(MediaType.APPLICATION_JSON))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.message").exists());
   }

@@ -3,7 +3,7 @@
 
 trigger:
   branches:
-    include:
+    include: 
       - main
       - develop
 
@@ -19,7 +19,7 @@ variables:
   
   # AWS Configuration (Set these in Azure DevOps Pipeline Variables or Variable Groups)
   - name: AWS_REGION
-    value: 'us-east-1'
+    value: '$(awsRegion)'  # Set in pipeline variables (e.g., us-east-1, eu-north-1)
   - name: AWS_ACCOUNT_ID
     value: '$(awsAccountId)'  # Set in pipeline variables
   - name: ECR_REPOSITORY
@@ -109,9 +109,172 @@ stages:
         publishLocation: 'pipeline'
       displayName: 'Publish JAR Artifact'
 
+- stage: Infrastructure
+  displayName: 'Setup AWS Infrastructure'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: InfrastructureJob
+    displayName: 'Setup VPC Endpoints for ECR'
+    steps:
+    # Install AWS CLI
+    - script: |
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip awscliv2.zip
+        sudo ./aws/install --update
+        aws --version
+      displayName: 'Install AWS CLI'
+    
+    # Setup VPC Endpoints for ECR (fixes ImagePullBackOff issues)
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e
+          
+          echo "======================================================"
+          echo "Setting up VPC Endpoints for ECR Access"
+          echo "======================================================"
+          echo ""
+          
+          # Get VPC ID from EKS cluster
+          echo "1. Getting VPC information from EKS cluster..."
+          VPC_ID=$(aws eks describe-cluster \
+            --name $(EKS_CLUSTER_NAME) \
+            --region $(AWS_REGION) \
+            --query 'cluster.resourcesVpcConfig.vpcId' \
+            --output text)
+          
+          echo "   VPC ID: $VPC_ID"
+          
+          # Get subnet IDs
+          echo ""
+          echo "2. Getting subnet information..."
+          SUBNET_IDS=$(aws eks describe-cluster \
+            --name $(EKS_CLUSTER_NAME) \
+            --region $(AWS_REGION) \
+            --query 'cluster.resourcesVpcConfig.subnetIds' \
+            --output text)
+          
+          SUBNET_ARRAY=($SUBNET_IDS)
+          echo "   Subnets: ${SUBNET_ARRAY[@]}"
+          
+          # Get security group
+          echo ""
+          echo "3. Getting security group..."
+          SG_ID=$(aws eks describe-cluster \
+            --name $(EKS_CLUSTER_NAME) \
+            --region $(AWS_REGION) \
+            --query 'cluster.resourcesVpcConfig.clusterSecurityGroupId' \
+            --output text)
+          
+          echo "   Security Group: $SG_ID"
+          
+          # Function to check if endpoint exists
+          check_endpoint() {
+            local service_name=$1
+            aws ec2 describe-vpc-endpoints \
+              --region $(AWS_REGION) \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=service-name,Values=$service_name" \
+              --query 'VpcEndpoints[0].VpcEndpointId' \
+              --output text 2>/dev/null
+          }
+          
+          # Create ECR API endpoint
+          echo ""
+          echo "4. Setting up ECR API endpoint..."
+          ECR_API_SERVICE="com.amazonaws.$(AWS_REGION).ecr.api"
+          EXISTING_ENDPOINT=$(check_endpoint $ECR_API_SERVICE)
+          
+          if [ "$EXISTING_ENDPOINT" != "None" ] && [ -n "$EXISTING_ENDPOINT" ]; then
+            echo "   ✅ ECR API endpoint already exists: $EXISTING_ENDPOINT"
+          else
+            echo "   Creating ECR API endpoint..."
+            aws ec2 create-vpc-endpoint \
+              --vpc-id $VPC_ID \
+              --vpc-endpoint-type Interface \
+              --service-name $ECR_API_SERVICE \
+              --subnet-ids ${SUBNET_ARRAY[@]} \
+              --security-group-ids $SG_ID \
+              --region $(AWS_REGION) \
+              --tag-specifications 'ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=eks-ecr-api},{Key=ManagedBy,Value=AzureDevOps}]' \
+              --query 'VpcEndpoint.VpcEndpointId' \
+              --output text
+            echo "   ✅ ECR API endpoint created successfully"
+          fi
+          
+          # Create ECR Docker endpoint
+          echo ""
+          echo "5. Setting up ECR Docker endpoint..."
+          ECR_DKR_SERVICE="com.amazonaws.$(AWS_REGION).ecr.dkr"
+          EXISTING_ENDPOINT=$(check_endpoint $ECR_DKR_SERVICE)
+          
+          if [ "$EXISTING_ENDPOINT" != "None" ] && [ -n "$EXISTING_ENDPOINT" ]; then
+            echo "   ✅ ECR Docker endpoint already exists: $EXISTING_ENDPOINT"
+          else
+            echo "   Creating ECR Docker endpoint..."
+            aws ec2 create-vpc-endpoint \
+              --vpc-id $VPC_ID \
+              --vpc-endpoint-type Interface \
+              --service-name $ECR_DKR_SERVICE \
+              --subnet-ids ${SUBNET_ARRAY[@]} \
+              --security-group-ids $SG_ID \
+              --region $(AWS_REGION) \
+              --tag-specifications 'ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=eks-ecr-dkr},{Key=ManagedBy,Value=AzureDevOps}]' \
+              --query 'VpcEndpoint.VpcEndpointId' \
+              --output text
+            echo "   ✅ ECR Docker endpoint created successfully"
+          fi
+          
+          # Create S3 Gateway endpoint
+          echo ""
+          echo "6. Setting up S3 Gateway endpoint..."
+          S3_SERVICE="com.amazonaws.$(AWS_REGION).s3"
+          EXISTING_ENDPOINT=$(check_endpoint $S3_SERVICE)
+          
+          if [ "$EXISTING_ENDPOINT" != "None" ] && [ -n "$EXISTING_ENDPOINT" ]; then
+            echo "   ✅ S3 Gateway endpoint already exists: $EXISTING_ENDPOINT"
+          else
+            echo "   Getting route tables..."
+            ROUTE_TABLE_IDS=$(aws ec2 describe-route-tables \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'RouteTables[].RouteTableId' \
+              --output text \
+              --region $(AWS_REGION))
+            
+            echo "   Creating S3 Gateway endpoint..."
+            aws ec2 create-vpc-endpoint \
+              --vpc-id $VPC_ID \
+              --vpc-endpoint-type Gateway \
+              --service-name $S3_SERVICE \
+              --route-table-ids $ROUTE_TABLE_IDS \
+              --region $(AWS_REGION) \
+              --tag-specifications 'ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=eks-s3-gateway},{Key=ManagedBy,Value=AzureDevOps}]' \
+              --query 'VpcEndpoint.VpcEndpointId' \
+              --output text
+            echo "   ✅ S3 Gateway endpoint created successfully"
+          fi
+          
+          echo ""
+          echo "======================================================"
+          echo "✅ Infrastructure setup complete!"
+          echo "======================================================"
+          echo ""
+          echo "VPC Endpoints allow EKS pods to access ECR without"
+          echo "needing a NAT Gateway or public internet access."
+          echo ""
+          echo "Cost: ~$7-10/month per interface endpoint"
+          echo "Total: ~$21-30/month for all 3 endpoints"
+          echo ""
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+      displayName: 'Create VPC Endpoints for ECR'
+
 - stage: Docker
   displayName: 'Build & Push Docker Image'
-  dependsOn: Build
+  dependsOn: Infrastructure
   condition: succeeded()
   jobs:
   - job: DockerJob
@@ -217,8 +380,15 @@ stages:
       displayName: 'Configure kubectl for EKS'
     
     # Create namespace if not exists
-    - script: |
-        kubectl create namespace $(K8S_NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          kubectl create namespace $(K8S_NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
       displayName: 'Create Kubernetes Namespace'
     
     # Update image tags in k8s manifests
@@ -229,36 +399,72 @@ stages:
       displayName: 'Update K8s Manifests'
     
     # Apply Kubernetes manifests
-    - script: |
-        echo "Applying Kubernetes manifests..."
-        kubectl apply -f k8s/namespace.yaml || echo "Namespace already exists"
-        kubectl apply -f k8s/configmap.yaml -n $(K8S_NAMESPACE)
-        kubectl apply -f k8s/deployment.yaml -n $(K8S_NAMESPACE)
-        kubectl apply -f k8s/service.yaml -n $(K8S_NAMESPACE)
-        kubectl apply -f k8s/ingress.yaml -n $(K8S_NAMESPACE) || echo "Ingress optional"
-        kubectl apply -f k8s/hpa.yaml -n $(K8S_NAMESPACE) || echo "HPA optional"
-        echo "Kubernetes manifests applied successfully"
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Applying Kubernetes manifests..."
+          kubectl apply -f k8s/namespace.yaml || echo "Namespace already exists"
+          kubectl apply -f k8s/configmap.yaml -n $(K8S_NAMESPACE)
+          kubectl apply -f k8s/deployment.yaml -n $(K8S_NAMESPACE)
+          kubectl apply -f k8s/service.yaml -n $(K8S_NAMESPACE)
+          kubectl apply -f k8s/ingress.yaml -n $(K8S_NAMESPACE) || echo "Ingress optional"
+          kubectl apply -f k8s/hpa.yaml -n $(K8S_NAMESPACE) || echo "HPA optional"
+          echo "Kubernetes manifests applied successfully"
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
       displayName: 'Deploy to Kubernetes'
     
-    # Wait for deployment rollout
-    - script: |
-        echo "Waiting for deployment to complete..."
-        kubectl rollout status deployment/greeting-api-deployment -n $(K8S_NAMESPACE) --timeout=5m
-      displayName: 'Wait for Deployment'
+    # Wait for deployment rollout with diagnostics
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Waiting for deployment to complete..."
+          kubectl rollout status deployment/greeting-api-deployment -n $(K8S_NAMESPACE) --timeout=10m || {
+            echo "Deployment timeout! Checking pod status..."
+            echo "=== Pod Status ==="
+            kubectl get pods -n $(K8S_NAMESPACE) -l app=greeting-api
+            echo ""
+            echo "=== Pod Descriptions ==="
+            kubectl describe pods -n $(K8S_NAMESPACE) -l app=greeting-api
+            echo ""
+            echo "=== Pod Logs ==="
+            for pod in $(kubectl get pods -n $(K8S_NAMESPACE) -l app=greeting-api -o jsonpath='{.items[*].metadata.name}'); do
+              echo "Logs for $pod:"
+              kubectl logs $pod -n $(K8S_NAMESPACE) --tail=50 || echo "No logs available"
+              echo "---"
+            done
+            exit 1
+          }
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+      displayName: 'Wait for Deployment with Diagnostics'
     
     # Display deployment information
-    - script: |
-        echo "===== Deployment Status ====="
-        kubectl get deployments -n $(K8S_NAMESPACE)
-        echo ""
-        echo "===== Pods ====="
-        kubectl get pods -n $(K8S_NAMESPACE) -l app=greeting-api
-        echo ""
-        echo "===== Services ====="
-        kubectl get services -n $(K8S_NAMESPACE)
-        echo ""
-        echo "===== Ingress ====="
-        kubectl get ingress -n $(K8S_NAMESPACE) || echo "No ingress configured"
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "===== Deployment Status ====="
+          kubectl get deployments -n $(K8S_NAMESPACE)
+          echo ""
+          echo "===== Pods ====="
+          kubectl get pods -n $(K8S_NAMESPACE) -l app=greeting-api
+          echo ""
+          echo "===== Services ====="
+          kubectl get services -n $(K8S_NAMESPACE)
+          echo ""
+          echo "===== Ingress ====="
+          kubectl get ingress -n $(K8S_NAMESPACE) || echo "No ingress configured"
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
       displayName: 'Display Deployment Info'
     
     # Run smoke tests (optional)
